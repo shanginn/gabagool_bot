@@ -44,6 +44,7 @@ MAX_EXPOSURE = 500.0  # Max capital allocated
 WS_ENDPOINT = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 CLOB_API = "https://clob.polymarket.com"
+DATA_API = "https://data-api.polymarket.com"
 
 # LOGGING
 logging.basicConfig(level=logging.ERROR)
@@ -127,12 +128,10 @@ def render_dashboard(state: MarketState) -> Layout:
         
         yes_signal = "✓ BUY" if (state.qty_no > 0 and pair_cost_yes < 0.98) else ""
         no_signal = "✓ BUY" if (state.qty_yes > 0 and pair_cost_no < 0.98) else ""
-        entry_signal = ""
-        if state.qty_yes == 0 and state.qty_no == 0:
-            if state.ask_yes < 0.45:
-                entry_signal = "ENTRY YES"
-            elif state.ask_no < 0.45:
-                entry_signal = "ENTRY NO"
+        
+        # Entry signal: buy when pair_cost is cheap enough to lock profit
+        pair_cost = state.ask_yes + state.ask_no
+        entry_signal = f"ENTRY ({pair_cost:.3f})" if pair_cost < 0.98 else ""
         
         table.add_row("Signals", yes_signal, no_signal, entry_signal)
 
@@ -178,6 +177,30 @@ class Bot:
         current_window_start = (now // window_size) * window_size
         return current_window_start + (offset_windows * window_size)
 
+    async def fetch_positions(self, session: aiohttp.ClientSession):
+        """Fetch real positions from Polymarket Data API"""
+        try:
+            async with session.get(
+                f"{DATA_API}/positions",
+                params={"user": POLYMARKET_PROXY, "sizeThreshold": 0},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    positions = await resp.json()
+                    for pos in positions:
+                        asset = pos.get('asset', '')
+                        size = float(pos.get('size', 0))
+                        avg_price = float(pos.get('avgPrice', 0))
+                        
+                        if asset == self.state.token_yes:
+                            self.state.qty_yes = size
+                            self.state.cost_yes = size * avg_price
+                        elif asset == self.state.token_no:
+                            self.state.qty_no = size
+                            self.state.cost_no = size * avg_price
+        except Exception as e:
+            self.state.debug = f"Position fetch error: {str(e)[:30]}"
+
     async def discover_market(self):
         """
         Finds 15-minute up/down crypto markets using slug pattern:
@@ -189,7 +212,7 @@ class Bot:
         self.state.status = "Scanning 15-min windows..."
         async with aiohttp.ClientSession() as session:
             try:
-                crypto_symbols = ['xrp', 'sol', 'eth', 'btc']
+                crypto_symbols = ['xrp'] #, 'sol', 'eth', 'btc']
                 
                 # Try current and next 15-min window
                 for offset in [0, 1]:
@@ -337,6 +360,11 @@ class Bot:
                     self.state.debug = "Creating session..."
                     live.update(render_dashboard(self.state))
                     async with aiohttp.ClientSession() as session:
+                        # Fetch existing positions for this market
+                        self.state.debug = "Fetching positions..."
+                        live.update(render_dashboard(self.state))
+                        await self.fetch_positions(session)
+                        
                         self.state.status = "Connecting to WebSocket..."
                         self.state.debug = "Connecting..."
                         live.update(render_dashboard(self.state))
@@ -388,26 +416,14 @@ class Bot:
                                             pair_cost = self.state.ask_yes + self.state.ask_no
                                             action = ""
                                             
-                                            # 1. Buy YES if cheap relative to our NO position
-                                            pair_cost_yes = self.state.ask_yes + self.state.avg_no
-                                            if self.state.qty_no > 0 and pair_cost_yes < (1.0 - TARGET_SPREAD):
-                                                await self.place_order(self.state.token_yes, self.state.ask_yes, "YES")
-                                                action = "BUY_YES_HEDGE"
-
-                                            # 2. Buy NO if cheap relative to our YES position
-                                            pair_cost_no = self.state.ask_no + self.state.avg_yes
-                                            if self.state.qty_yes > 0 and pair_cost_no < (1.0 - TARGET_SPREAD):
-                                                await self.place_order(self.state.token_no, self.state.ask_no, "NO")
-                                                action = "BUY_NO_HEDGE"
-
-                                            # 3. Entry (If empty, buy cheap side)
-                                            if self.state.qty_yes == 0 and self.state.qty_no == 0:
-                                                if self.state.ask_yes < 0.45:
+                                            # Entry: Buy the cheaper side when pair_cost is attractive
+                                            if pair_cost < (1.0 - TARGET_SPREAD):
+                                                if self.state.ask_yes <= self.state.ask_no:
                                                     await self.place_order(self.state.token_yes, self.state.ask_yes, "YES")
-                                                    action = "ENTRY_YES"
-                                                elif self.state.ask_no < 0.45:
+                                                    action = "BUY_YES"
+                                                else:
                                                     await self.place_order(self.state.token_no, self.state.ask_no, "NO")
-                                                    action = "ENTRY_NO"
+                                                    action = "BUY_NO"
                                             
                                             if action:
                                                 self.state.debug = f"[{action}] Y:{self.state.ask_yes:.3f} N:{self.state.ask_no:.3f} Cost:{pair_cost:.3f}"
