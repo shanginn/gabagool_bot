@@ -30,12 +30,11 @@ if not PRIVATE_KEY:
 # STRATEGY SETTINGS
 TARGET_SPREAD = 0.015
 BET_SIZE_USDC = 10.0
-MAX_EXPOSURE = 200.0
 
-# --- NEW SETTING: IMBALANCE LIMIT ---
-# The bot will stop buying a side if it is ahead of the other side by this amount.
-# e.g. If you have 100 YES and 0 NO, it will block buying YES until you buy NO.
-MAX_IMBALANCE_SHARES = 25.0
+# --- RISK SETTINGS (NEW) ---
+SOFT_LIMIT_USD = 100.0  # Stop opening NEW positions here
+HARD_LIMIT_USD = 300.0  # Absolute stop.
+MAX_IMBALANCE_SHARES = 50.0  # <--- NEW: CRITICAL FIX. Max difference between YES/NO shares.
 
 # NETWORK CONSTANTS
 WS_ENDPOINT = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -53,6 +52,77 @@ def fire_and_forget(f):
         return asyncio.create_task(f(*args, **kwargs))
 
     return wrapped
+
+
+# --- RISK MANAGER ---
+class RiskManager:
+    def __init__(self, soft_limit, hard_limit, max_imbalance):
+        self.soft_limit = soft_limit
+        self.hard_limit = hard_limit
+        self.max_imbalance = max_imbalance
+
+        # Tracks current exposure in USD
+        self.current_gross_exposure = 0.0
+        # Tracks share counts: {'market_id': {'YES': 0.0, 'NO': 0.0}}
+        self.positions = {}
+
+    def reset_for_new_market(self):
+        """Resets internal counters when bot switches to a new market"""
+        self.current_gross_exposure = 0.0
+        self.positions = {}
+
+    def get_position(self, market_id):
+        if market_id not in self.positions:
+            self.positions[market_id] = {'YES': 0.0, 'NO': 0.0}
+        return self.positions[market_id]
+
+    def sync_from_api(self, market_id, qty_yes, cost_yes, qty_no, cost_no):
+        """Syncs the Risk Manager state with actual API data"""
+        self.current_gross_exposure = cost_yes + cost_no
+        self.positions[market_id] = {'YES': qty_yes, 'NO': qty_no}
+
+    def update_post_trade(self, market_id, side, cost, shares):
+        """Call this AFTER a trade is successfully executed"""
+        self.current_gross_exposure += cost
+        position = self.get_position(market_id)
+        position[side] += shares
+
+    def check_order_permission(self, market_id, side, estimated_cost, current_qty_yes, current_qty_no) -> tuple[
+        bool, str]:
+        """
+        Returns (Allowed: bool, Reason: str)
+        Checks Exposure Limits AND Imbalance Limits.
+        """
+        # 1. CHECK IMBALANCE (The Fix)
+        # If we want to buy YES, we check if YES is already too far ahead of NO
+        if side == "YES":
+            if (current_qty_yes - current_qty_no) > self.max_imbalance:
+                return False, f"IMBALANCE: YES is +{current_qty_yes - current_qty_no:.1f} ahead"
+        elif side == "NO":
+            if (current_qty_no - current_qty_yes) > self.max_imbalance:
+                return False, f"IMBALANCE: NO is +{current_qty_no - current_qty_yes:.1f} ahead"
+
+        # 2. CHECK FINANCIAL LIMITS
+        projected_exposure = self.current_gross_exposure + estimated_cost
+
+        # Hard Limit
+        if projected_exposure > self.hard_limit:
+            return False, f"HARD LIMIT: ${projected_exposure:.2f} > ${self.hard_limit}"
+
+        # Soft Limit
+        if projected_exposure <= self.soft_limit:
+            return True, "OK"
+
+        # Buffer Zone (Only Allow Catch-up Trades)
+        # If we are in buffer zone, we ONLY allow trades that reduce imbalance
+        is_catchup = False
+        if side == "YES" and current_qty_yes < current_qty_no: is_catchup = True
+        if side == "NO" and current_qty_no < current_qty_yes: is_catchup = True
+
+        if is_catchup:
+            return True, "OK (Catch-up in Buffer)"
+        else:
+            return False, "BLOCKED: Risk Increase in Buffer"
 
 
 # --- STATE MANAGEMENT ---
@@ -97,7 +167,7 @@ class MarketState:
 
 
 # --- UI ---
-def render_dashboard(state: MarketState) -> Layout:
+def render_dashboard(state: MarketState, risk_manager: RiskManager) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
@@ -111,49 +181,57 @@ def render_dashboard(state: MarketState) -> Layout:
     table.add_column("Metric", style="cyan")
     table.add_column("YES", style="green")
     table.add_column("NO", style="red")
-    table.add_column("Strategy", style="yellow")
+    table.add_column("Action", style="yellow")
 
     pair_cost_now = state.ask_yes + state.ask_no
     table.add_row("Market Price", f"${state.ask_yes:.3f}", f"${state.ask_no:.3f}", f"Sum: {pair_cost_now:.3f}")
-    table.add_row("My Avg Cost", f"${state.avg_yes:.3f}", f"${state.avg_no:.3f}",
-                  f"Locked Profit: ${state.locked_profit:.2f}")
+    table.add_row("My Shares", f"{state.qty_yes:.1f}", f"{state.qty_no:.1f}", f"Delta: {state.imbalance:.1f}")
+    table.add_row("My Avg Cost", f"${state.avg_yes:.3f}", f"${state.avg_no:.3f}", f"Locked: ${state.locked_profit:.2f}")
 
     eff_cost_yes = state.ask_yes + (state.avg_no if state.qty_no > 0 else state.ask_no)
     eff_cost_no = state.ask_no + (state.avg_yes if state.qty_yes > 0 else state.ask_yes)
 
     target = 1.0 - TARGET_SPREAD
 
-    # Logic visualizer
-    imb = state.imbalance
+    # Risk/Permission Check
+    can_buy_yes, reason_yes = risk_manager.check_order_permission(state.slug, "YES", BET_SIZE_USDC, state.qty_yes,
+                                                                  state.qty_no)
+    can_buy_no, reason_no = risk_manager.check_order_permission(state.slug, "NO", BET_SIZE_USDC, state.qty_yes,
+                                                                state.qty_no)
 
-    # YES Signal logic
-    if imb > MAX_IMBALANCE_SHARES:
-        sig_yes = "[dim]BLOCKED (Too Heavy)[/]"
+    # Signal Generation
+    if not can_buy_yes:
+        sig_yes = f"[dim red]{reason_yes}[/]"
     elif eff_cost_yes < target:
-        sig_yes = f"[bold green]BUY ({eff_cost_yes:.3f})[/]"
+        sig_yes = f"[bold green]BUY @ {state.ask_yes:.2f}[/]"
     else:
-        sig_yes = ""
+        sig_yes = "[dim]Wait[/]"
 
-    # NO Signal logic
-    if imb < -MAX_IMBALANCE_SHARES:
-        sig_no = "[dim]BLOCKED (Too Heavy)[/]"
+    if not can_buy_no:
+        sig_no = f"[dim red]{reason_no}[/]"
     elif eff_cost_no < target:
-        sig_no = f"[bold green]BUY ({eff_cost_no:.3f})[/]"
+        sig_no = f"[bold green]BUY @ {state.ask_no:.2f}[/]"
     else:
-        sig_no = ""
+        sig_no = "[dim]Wait[/]"
 
-    table.add_row("Hedged Entry", sig_yes, sig_no, f"Target < {target:.3f}")
+    table.add_row("Strategy", sig_yes, sig_no, f"Target < {target:.3f}")
 
     body_content = Table.grid(expand=True)
     body_content.add_row(Panel(table, title=f"Market: {state.question}"))
     layout["body"].update(body_content)
 
+    exposure_color = "green"
+    if risk_manager.current_gross_exposure > SOFT_LIMIT_USD:
+        exposure_color = "yellow"
+    if risk_manager.current_gross_exposure >= HARD_LIMIT_USD:
+        exposure_color = "red"
+
     stats_header = (
         f"Trades: {state.total_trades_session} | "
-        f"Exp: ${state.cost_yes + state.cost_no:.0f}/${MAX_EXPOSURE} | "
-        f"Delta: {state.imbalance:.1f} (Max {MAX_IMBALANCE_SHARES})"
+        f"Exp: [{exposure_color}]${risk_manager.current_gross_exposure:.2f}[/] | "
+        f"Max Delta: {MAX_IMBALANCE_SHARES}"
     )
-    log_style = "red" if "Ex" in state.debug or "Err" in state.debug else "white"
+    log_style = "red" if "Ex" in state.debug or "Err" in state.debug or "Block" in state.debug else "white"
     layout["footer"].update(Panel(state.debug, title=stats_header, style=log_style))
     return layout
 
@@ -162,6 +240,12 @@ def render_dashboard(state: MarketState) -> Layout:
 class Bot:
     def __init__(self):
         self.state = MarketState()
+        self.risk_manager = RiskManager(
+            soft_limit=SOFT_LIMIT_USD,
+            hard_limit=HARD_LIMIT_USD,
+            max_imbalance=MAX_IMBALANCE_SHARES
+        )
+
         self.client = ClobClient(
             host=CLOB_API,
             key=PRIVATE_KEY,
@@ -202,6 +286,14 @@ class Bot:
                                 elif asset == self.state.token_no:
                                     self.state.qty_no = size
                                     self.state.cost_no = size * avg_price
+
+                        if self.state.slug:
+                            self.risk_manager.sync_from_api(
+                                self.state.slug,
+                                self.state.qty_yes, self.state.cost_yes,
+                                self.state.qty_no, self.state.cost_no
+                            )
+
         except Exception as e:
             self.state.debug = f"Pos Error: {str(e)}"
 
@@ -209,7 +301,7 @@ class Bot:
         self.state.status = "Scanning 15-min windows..."
         async with aiohttp.ClientSession() as session:
             try:
-                crypto_symbols = ['eth'] #'xrp', 'sol', 'btc']
+                crypto_symbols = ['eth']  # Focus on ETH as per user data
 
                 for offset in [0, 1]:
                     epoch = self.get_15min_window_epoch(offset)
@@ -280,28 +372,22 @@ class Bot:
             if (datetime.now().timestamp() - self.state.last_trade_ts) < 0.5: return
             self.state.last_trade_ts = datetime.now().timestamp()
 
-            # 1. EXPOSURE CHECK
-            if (self.state.cost_yes + self.state.cost_no) >= MAX_EXPOSURE:
-                self.state.debug = f"Max Exposure (${MAX_EXPOSURE}) Reached!"
-                return
+            # --- RISK MANAGER CHECK ---
+            allowed, reason = self.risk_manager.check_order_permission(
+                self.state.slug,
+                side_str,
+                BET_SIZE_USDC,
+                self.state.qty_yes,
+                self.state.qty_no
+            )
 
-            # 2. IMBALANCE PROTECTION (Gambling Prevention)
-            # If I have 100 YES and 0 NO, Imbalance is +100.
-            # If I try to buy YES: (+100 > 25) -> Block.
-            current_imbalance = self.state.qty_yes - self.state.qty_no
-
-            if side_str == "YES" and current_imbalance > MAX_IMBALANCE_SHARES:
-                self.state.debug = f"SKIP YES: Too heavy on YES (+{current_imbalance:.1f})"
-                return
-
-            if side_str == "NO" and current_imbalance < -MAX_IMBALANCE_SHARES:
-                self.state.debug = f"SKIP NO: Too heavy on NO ({current_imbalance:.1f})"
+            if not allowed:
+                self.state.debug = f"BLOCKED: {reason}"
                 return
 
             size = round(BET_SIZE_USDC / price, 2)
             if size < 2: return
 
-            # 3. PLACE ORDER
             expiration = int((datetime.now(timezone.utc) + timedelta(minutes=2)).timestamp())
 
             order = OrderArgs(
@@ -320,29 +406,34 @@ class Bot:
                 self.state.total_trades_session += 1
                 self.state.debug = f"BOUGHT {side_str} @ {price:.3f}"
                 cost = size * price
+
                 if side_str == "YES":
                     self.state.qty_yes += size
                     self.state.cost_yes += cost
                 else:
                     self.state.qty_no += size
                     self.state.cost_no += cost
+
+                self.risk_manager.update_post_trade(self.state.slug, side_str, cost, size)
+
             elif isinstance(resp, list):
-                self.state.debug = f"Order Err (List): {resp}"
+                self.state.debug = f"Order Err: {resp}"
             else:
                 self.state.debug = f"Order Fail: {resp}"
         except Exception as e:
             self.state.debug = f"Order Ex: {str(e)}"
 
     async def run(self):
-        with Live(render_dashboard(self.state), refresh_per_second=4, screen=True) as live:
+        with Live(render_dashboard(self.state, self.risk_manager), refresh_per_second=4, screen=True) as live:
             while True:
-                # 1. Discovery
                 market = await self.discover_market()
                 if not market:
                     await asyncio.sleep(2)
                     continue
 
-                # 2. Setup
+                if self.state.slug != market['slug']:
+                    self.risk_manager.reset_for_new_market()
+
                 self.state.reset()
                 self.state.question = market['question']
                 self.state.slug = market['slug']
@@ -356,12 +447,11 @@ class Bot:
 
                 self.state.end_time = datetime.fromisoformat(market['endDate'].replace('Z', '+00:00'))
 
-                # 3. Execution
                 try:
                     async with aiohttp.ClientSession() as session:
                         await self.fetch_positions(session)
                         self.state.status = "Connecting..."
-                        live.update(render_dashboard(self.state))
+                        live.update(render_dashboard(self.state, self.risk_manager))
 
                         async with session.ws_connect(
                                 WS_ENDPOINT,
@@ -384,6 +474,7 @@ class Bot:
                                         data = json.loads(msg.data)
 
                                         if isinstance(data, dict):
+                                            # Update Prices
                                             for change in data.get('price_changes', []):
                                                 if isinstance(change, dict) and change.get('side') == 'SELL':
                                                     p = float(change.get('price', 0))
@@ -393,46 +484,56 @@ class Bot:
                                                     elif aid == self.state.token_no:
                                                         self.state.ask_no = p
 
-                                            # --- STRATEGY ENGINE ---
                                             if self.state.ask_yes > 0 and self.state.ask_no > 0:
-
                                                 eff_no = self.state.avg_no if self.state.qty_no > 0 else self.state.ask_no
                                                 eff_yes = self.state.avg_yes if self.state.qty_yes > 0 else self.state.ask_yes
 
-                                                # PURE ARB CHECK (If spread is NEGATIVE, buy BOTH immediately)
+                                                # --- STRATEGY CORE ---
+
+                                                # Check permissions FIRST
+                                                can_buy_yes, _ = self.risk_manager.check_order_permission(
+                                                    self.state.slug, "YES", BET_SIZE_USDC, self.state.qty_yes,
+                                                    self.state.qty_no
+                                                )
+                                                can_buy_no, _ = self.risk_manager.check_order_permission(
+                                                    self.state.slug, "NO", BET_SIZE_USDC, self.state.qty_yes,
+                                                    self.state.qty_no
+                                                )
+
+                                                # Execute YES if permitted and profitable
+                                                if can_buy_yes and (self.state.ask_yes + eff_no) < (
+                                                        1.0 - TARGET_SPREAD):
+                                                    await self.place_order(self.state.token_yes, self.state.ask_yes,
+                                                                           "YES")
+
+                                                # Execute NO if permitted and profitable
+                                                if can_buy_no and (self.state.ask_no + eff_yes) < (1.0 - TARGET_SPREAD):
+                                                    await self.place_order(self.state.token_no, self.state.ask_no, "NO")
+
+                                                # Emergency Arb (Both Cheap)
                                                 if (self.state.ask_yes + self.state.ask_no) < 0.99:
-                                                    # Free money: Fire both regardless of balance
-                                                    await self.place_order(self.state.token_yes, self.state.ask_yes,
-                                                                           "YES")
-                                                    await self.place_order(self.state.token_no, self.state.ask_no, "NO")
+                                                    # Only fire if not strictly blocked by hard limit
+                                                    if can_buy_yes: await self.place_order(self.state.token_yes,
+                                                                                           self.state.ask_yes, "YES")
+                                                    if can_buy_no: await self.place_order(self.state.token_no,
+                                                                                          self.state.ask_no, "NO")
 
-                                                # GABAGOOL (LEGGING IN)
-                                                elif (self.state.ask_yes + eff_no) < (1.0 - TARGET_SPREAD):
-                                                    await self.place_order(self.state.token_yes, self.state.ask_yes,
-                                                                           "YES")
-
-                                                elif (self.state.ask_no + eff_yes) < (1.0 - TARGET_SPREAD):
-                                                    await self.place_order(self.state.token_no, self.state.ask_no, "NO")
-
-                                        live.update(render_dashboard(self.state))
+                                        live.update(render_dashboard(self.state, self.risk_manager))
 
                                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                        self.state.debug = "WS Closed from Server"
+                                        self.state.debug = "WS Closed"
                                         break
-                                    elif msg.type == aiohttp.WSMsgType.PING:
-                                        pass
-
                                 except asyncio.TimeoutError:
                                     pass
-                                except (aiohttp.ClientConnectionError, ConnectionResetError) as net_err:
-                                    self.state.debug = f"Net Err: {str(net_err)}"
+                                except Exception as e:
+                                    self.state.debug = f"Net Err: {str(e)}"
                                     break
                 except Exception as e:
                     self.state.debug = f"Loop Err: {str(e)}"
                     await asyncio.sleep(1)
 
                 self.state.status = "Market Ended (or Reconnecting)..."
-                live.update(render_dashboard(self.state))
+                live.update(render_dashboard(self.state, self.risk_manager))
                 await asyncio.sleep(2)
 
 
