@@ -1,14 +1,3 @@
-# /// script
-# requires-python = ">=3.10"
-# dependencies = [
-#     "aiohttp",
-#     "py-clob-client",
-#     "python-dotenv",
-#     "rich",
-#     "websockets",
-# ]
-# ///
-
 import asyncio
 import os
 import sys

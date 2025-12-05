@@ -1091,11 +1091,11 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiohttp", specifier = ">=3.13.2" },
-    { name = "py-clob-client", specifier = ">=0.28.0" },
-    { name = "python-dotenv", specifier = ">=1.2.1" },
-    { name = "rich", specifier = ">=14.2.0" },
-    { name = "websockets", specifier = ">=15.0.1" },
+    { name = "aiohttp" },
+    { name = "py-clob-client" },
+    { name = "python-dotenv" },
+    { name = "rich" },
+    { name = "websockets" },
 ]
 
 [[package]]
