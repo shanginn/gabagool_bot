@@ -33,7 +33,7 @@ BET_SIZE_USDC = 10.0
 
 # --- RISK SETTINGS (NEW) ---
 SOFT_LIMIT_USD = 100.0  # Stop opening NEW positions here
-HARD_LIMIT_USD = 300.0  # Absolute stop.
+HARD_LIMIT_USD = 250.0  # Absolute stop.
 MAX_IMBALANCE_SHARES = 50.0  # <--- NEW: CRITICAL FIX. Max difference between YES/NO shares.
 
 # NETWORK CONSTANTS
