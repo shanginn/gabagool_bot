@@ -1,0 +1,13 @@
+[project]
+name = "pypolybot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.13.2",
+    "py-clob-client>=0.28.0",
+    "python-dotenv>=1.2.1",
+    "rich>=14.2.0",
+    "websockets>=15.0.1",
+]
