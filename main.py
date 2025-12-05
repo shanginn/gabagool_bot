@@ -32,7 +32,7 @@ from rich import box
 load_dotenv()
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-# Default Proxy from your original script
+# Default Proxy
 POLYMARKET_PROXY = os.getenv("POLYMARKET_PROXY", "0x2BA56d3A4492Cda34c31dA0a8d0a48c7e9932560")
 
 if not PRIVATE_KEY:
@@ -41,8 +41,10 @@ if not PRIVATE_KEY:
 
 # STRATEGY SETTINGS
 TARGET_SPREAD = 0.015  # Buy if Combined Cost < 0.985
-BET_SIZE_USDC = 10.0
-MAX_EXPOSURE = 1000.0
+BET_SIZE_USDC = 10.0  # Bet size per trade
+
+# --- UPDATED EXPOSURE LIMIT ---
+MAX_EXPOSURE = 400.0  # Stop buying if we have spent $400 in this market
 
 # NETWORK CONSTANTS
 WS_ENDPOINT = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -105,7 +107,7 @@ def render_dashboard(state: MarketState) -> Layout:
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="body", ratio=1),
-        Layout(name="footer", size=10)  # Expanded footer for logs
+        Layout(name="footer", size=10)
     )
 
     layout["header"].update(Panel(f"🧠 GABAGOOL BOT | STATUS: [bold green]{state.status}[/]"))
@@ -135,7 +137,7 @@ def render_dashboard(state: MarketState) -> Layout:
     body_content.add_row(Panel(table, title=f"Market: {state.question}"))
     layout["body"].update(body_content)
 
-    stats_header = f"Trades: {state.total_trades_session} | Exposure: ${state.cost_yes + state.cost_no:.2f}"
+    stats_header = f"Trades: {state.total_trades_session} | Exposure: ${state.cost_yes + state.cost_no:.2f} / ${MAX_EXPOSURE}"
     log_style = "red" if "Ex" in state.debug or "Err" in state.debug else "white"
     layout["footer"].update(Panel(state.debug, title=stats_header, style=log_style))
     return layout
@@ -145,7 +147,6 @@ def render_dashboard(state: MarketState) -> Layout:
 class Bot:
     def __init__(self):
         self.state = MarketState()
-        # --- 1. ORIGINAL AUTH (Working) ---
         self.client = ClobClient(
             host=CLOB_API,
             key=PRIVATE_KEY,
@@ -190,7 +191,6 @@ class Bot:
             self.state.debug = f"Pos Error: {str(e)}"
 
     async def discover_market(self):
-        """Original Discovery Logic (Working)"""
         self.state.status = "Scanning 15-min windows..."
         async with aiohttp.ClientSession() as session:
             try:
@@ -230,7 +230,6 @@ class Bot:
 
                                 end_dt = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
 
-                                # Strict check: trade until the last second
                                 if end_dt <= datetime.now(timezone.utc):
                                     continue
 
@@ -266,13 +265,15 @@ class Bot:
             if (datetime.now().timestamp() - self.state.last_trade_ts) < 0.5: return
             self.state.last_trade_ts = datetime.now().timestamp()
 
-            if (self.state.cost_yes + self.state.cost_no) > MAX_EXPOSURE: return
+            # CHECK EXPOSURE LIMIT
+            if (self.state.cost_yes + self.state.cost_no) >= MAX_EXPOSURE:
+                self.state.debug = f"Max Exposure (${MAX_EXPOSURE}) Reached!"
+                return
 
             size = round(BET_SIZE_USDC / price, 2)
             if size < 2: return
 
-            # --- 2. FIXED EXPIRATION ---
-            # API requires > 1 minute buffer. We use 2 minutes.
+            # Fixed expiration (Now + 2 mins)
             expiration = int((datetime.now(timezone.utc) + timedelta(minutes=2)).timestamp())
 
             order = OrderArgs(
@@ -327,7 +328,7 @@ class Bot:
 
                 self.state.end_time = datetime.fromisoformat(market['endDate'].replace('Z', '+00:00'))
 
-                # 3. Execution (With Keep-Alive and Heartbeats)
+                # 3. Execution
                 try:
                     async with aiohttp.ClientSession() as session:
                         await self.fetch_positions(session)
