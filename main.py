@@ -32,7 +32,7 @@ from rich import box
 load_dotenv()
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-# Default Proxy
+# Default Proxy from your original script
 POLYMARKET_PROXY = os.getenv("POLYMARKET_PROXY", "0x2BA56d3A4492Cda34c31dA0a8d0a48c7e9932560")
 
 if not PRIVATE_KEY:
@@ -40,7 +40,7 @@ if not PRIVATE_KEY:
     sys.exit(1)
 
 # STRATEGY SETTINGS
-TARGET_SPREAD = 0.015  # We want Pair Cost < 0.985
+TARGET_SPREAD = 0.015  # Buy if Combined Cost < 0.985
 BET_SIZE_USDC = 10.0
 MAX_EXPOSURE = 1000.0
 
@@ -105,8 +105,7 @@ def render_dashboard(state: MarketState) -> Layout:
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="body", ratio=1),
-        # INCREASED SIZE FROM 5 TO 10 FOR LOGS
-        Layout(name="footer", size=10)
+        Layout(name="footer", size=10)  # Expanded footer for logs
     )
 
     layout["header"].update(Panel(f"🧠 GABAGOOL BOT | STATUS: [bold green]{state.status}[/]"))
@@ -136,12 +135,8 @@ def render_dashboard(state: MarketState) -> Layout:
     body_content.add_row(Panel(table, title=f"Market: {state.question}"))
     layout["body"].update(body_content)
 
-    # UPDATED FOOTER LAYOUT
-    # We display the stats in the title and the full log message in the body
     stats_header = f"Trades: {state.total_trades_session} | Exposure: ${state.cost_yes + state.cost_no:.2f}"
     log_style = "red" if "Ex" in state.debug or "Err" in state.debug else "white"
-
-    # Text will wrap automatically in the Panel
     layout["footer"].update(Panel(state.debug, title=stats_header, style=log_style))
     return layout
 
@@ -150,7 +145,7 @@ def render_dashboard(state: MarketState) -> Layout:
 class Bot:
     def __init__(self):
         self.state = MarketState()
-        # Original Auth Logic
+        # --- 1. ORIGINAL AUTH (Working) ---
         self.client = ClobClient(
             host=CLOB_API,
             key=PRIVATE_KEY,
@@ -192,11 +187,10 @@ class Bot:
                                     self.state.qty_no = size
                                     self.state.cost_no = size * avg_price
         except Exception as e:
-            # REMOVED TRUNCATION HERE
             self.state.debug = f"Pos Error: {str(e)}"
 
     async def discover_market(self):
-        """Original Discovery Logic"""
+        """Original Discovery Logic (Working)"""
         self.state.status = "Scanning 15-min windows..."
         async with aiohttp.ClientSession() as session:
             try:
@@ -236,6 +230,7 @@ class Bot:
 
                                 end_dt = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
 
+                                # Strict check: trade until the last second
                                 if end_dt <= datetime.now(timezone.utc):
                                     continue
 
@@ -260,7 +255,6 @@ class Bot:
                 await asyncio.sleep(1)
 
             except Exception as e:
-                # REMOVED TRUNCATION HERE
                 self.state.status = f"Discovery Error: {str(e)}"
                 await asyncio.sleep(2)
 
@@ -277,8 +271,17 @@ class Bot:
             size = round(BET_SIZE_USDC / price, 2)
             if size < 2: return
 
-            expiration = int((datetime.now(timezone.utc) + timedelta(seconds=10)).timestamp())
-            order = OrderArgs(price=price, size=size, side="BUY", token_id=token_id, expiration=expiration)
+            # --- 2. FIXED EXPIRATION ---
+            # API requires > 1 minute buffer. We use 2 minutes.
+            expiration = int((datetime.now(timezone.utc) + timedelta(minutes=2)).timestamp())
+
+            order = OrderArgs(
+                price=price,
+                size=size,
+                side="BUY",
+                token_id=token_id,
+                expiration=expiration
+            )
 
             loop = asyncio.get_running_loop()
             signed_order = await loop.run_in_executor(None, lambda: self.client.create_order(order))
@@ -299,7 +302,6 @@ class Bot:
             else:
                 self.state.debug = f"Order Fail: {resp}"
         except Exception as e:
-            # REMOVED TRUNCATION HERE - Shows full error now
             self.state.debug = f"Order Ex: {str(e)}"
 
     async def run(self):
@@ -325,7 +327,7 @@ class Bot:
 
                 self.state.end_time = datetime.fromisoformat(market['endDate'].replace('Z', '+00:00'))
 
-                # 3. Execution (With Keep-Alive)
+                # 3. Execution (With Keep-Alive and Heartbeats)
                 try:
                     async with aiohttp.ClientSession() as session:
                         await self.fetch_positions(session)
@@ -387,7 +389,6 @@ class Bot:
                                     self.state.debug = f"Net Err: {str(net_err)}"
                                     break
                 except Exception as e:
-                    # REMOVED TRUNCATION HERE
                     self.state.debug = f"Loop Err: {str(e)}"
                     await asyncio.sleep(1)
 
