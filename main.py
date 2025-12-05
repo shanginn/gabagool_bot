@@ -301,7 +301,7 @@ class Bot:
         self.state.status = "Scanning 15-min windows..."
         async with aiohttp.ClientSession() as session:
             try:
-                crypto_symbols = ['eth']  # Focus on ETH as per user data
+                crypto_symbols = ['btc']  # Focus on ETH as per user data
 
                 for offset in [0, 1]:
                     epoch = self.get_15min_window_epoch(offset)
