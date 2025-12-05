@@ -44,7 +44,7 @@ TARGET_SPREAD = 0.015  # Buy if Combined Cost < 0.985
 BET_SIZE_USDC = 10.0  # Bet size per trade
 
 # --- UPDATED EXPOSURE LIMIT ---
-MAX_EXPOSURE = 400.0  # Stop buying if we have spent $400 in this market
+MAX_EXPOSURE = 500.0  # Stop buying if we have spent $400 in this market
 
 # NETWORK CONSTANTS
 WS_ENDPOINT = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
