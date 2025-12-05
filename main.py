@@ -32,7 +32,6 @@ from rich import box
 load_dotenv()
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-# Default Proxy
 POLYMARKET_PROXY = os.getenv("POLYMARKET_PROXY", "0x2BA56d3A4492Cda34c31dA0a8d0a48c7e9932560")
 
 if not PRIVATE_KEY:
@@ -40,11 +39,14 @@ if not PRIVATE_KEY:
     sys.exit(1)
 
 # STRATEGY SETTINGS
-TARGET_SPREAD = 0.015  # Buy if Combined Cost < 0.985
-BET_SIZE_USDC = 10.0  # Bet size per trade
+TARGET_SPREAD = 0.015
+BET_SIZE_USDC = 10.0
+MAX_EXPOSURE = 200.0
 
-# --- UPDATED EXPOSURE LIMIT ---
-MAX_EXPOSURE = 500.0  # Stop buying if we have spent $400 in this market
+# --- NEW SETTING: IMBALANCE LIMIT ---
+# The bot will stop buying a side if it is ahead of the other side by this amount.
+# e.g. If you have 100 YES and 0 NO, it will block buying YES until you buy NO.
+MAX_IMBALANCE_SHARES = 25.0
 
 # NETWORK CONSTANTS
 WS_ENDPOINT = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -100,6 +102,10 @@ class MarketState:
         cost_basis = (self.avg_yes * common) + (self.avg_no * common)
         return common - cost_basis
 
+    @property
+    def imbalance(self):
+        return self.qty_yes - self.qty_no
+
 
 # --- UI ---
 def render_dashboard(state: MarketState) -> Layout:
@@ -123,13 +129,29 @@ def render_dashboard(state: MarketState) -> Layout:
     table.add_row("My Avg Cost", f"${state.avg_yes:.3f}", f"${state.avg_no:.3f}",
                   f"Locked Profit: ${state.locked_profit:.2f}")
 
-    # GABAGOOL SIGNALS
     eff_cost_yes = state.ask_yes + (state.avg_no if state.qty_no > 0 else state.ask_no)
     eff_cost_no = state.ask_no + (state.avg_yes if state.qty_yes > 0 else state.ask_yes)
 
     target = 1.0 - TARGET_SPREAD
-    sig_yes = f"BUY ({eff_cost_yes:.3f})" if eff_cost_yes < target else ""
-    sig_no = f"BUY ({eff_cost_no:.3f})" if eff_cost_no < target else ""
+
+    # Logic visualizer
+    imb = state.imbalance
+
+    # YES Signal logic
+    if imb > MAX_IMBALANCE_SHARES:
+        sig_yes = "[dim]BLOCKED (Too Heavy)[/]"
+    elif eff_cost_yes < target:
+        sig_yes = f"[bold green]BUY ({eff_cost_yes:.3f})[/]"
+    else:
+        sig_yes = ""
+
+    # NO Signal logic
+    if imb < -MAX_IMBALANCE_SHARES:
+        sig_no = "[dim]BLOCKED (Too Heavy)[/]"
+    elif eff_cost_no < target:
+        sig_no = f"[bold green]BUY ({eff_cost_no:.3f})[/]"
+    else:
+        sig_no = ""
 
     table.add_row("Hedged Entry", sig_yes, sig_no, f"Target < {target:.3f}")
 
@@ -137,7 +159,11 @@ def render_dashboard(state: MarketState) -> Layout:
     body_content.add_row(Panel(table, title=f"Market: {state.question}"))
     layout["body"].update(body_content)
 
-    stats_header = f"Trades: {state.total_trades_session} | Exposure: ${state.cost_yes + state.cost_no:.2f} / ${MAX_EXPOSURE}"
+    stats_header = (
+        f"Trades: {state.total_trades_session} | "
+        f"Exp: ${state.cost_yes + state.cost_no:.0f}/${MAX_EXPOSURE} | "
+        f"Delta: {state.imbalance:.1f} (Max {MAX_IMBALANCE_SHARES})"
+    )
     log_style = "red" if "Ex" in state.debug or "Err" in state.debug else "white"
     layout["footer"].update(Panel(state.debug, title=stats_header, style=log_style))
     return layout
@@ -194,7 +220,7 @@ class Bot:
         self.state.status = "Scanning 15-min windows..."
         async with aiohttp.ClientSession() as session:
             try:
-                crypto_symbols = ['xrp', 'sol', 'eth', 'btc']
+                crypto_symbols = ['eth'] #'xrp', 'sol', 'btc']
 
                 for offset in [0, 1]:
                     epoch = self.get_15min_window_epoch(offset)
@@ -265,15 +291,28 @@ class Bot:
             if (datetime.now().timestamp() - self.state.last_trade_ts) < 0.5: return
             self.state.last_trade_ts = datetime.now().timestamp()
 
-            # CHECK EXPOSURE LIMIT
+            # 1. EXPOSURE CHECK
             if (self.state.cost_yes + self.state.cost_no) >= MAX_EXPOSURE:
                 self.state.debug = f"Max Exposure (${MAX_EXPOSURE}) Reached!"
+                return
+
+            # 2. IMBALANCE PROTECTION (Gambling Prevention)
+            # If I have 100 YES and 0 NO, Imbalance is +100.
+            # If I try to buy YES: (+100 > 25) -> Block.
+            current_imbalance = self.state.qty_yes - self.state.qty_no
+
+            if side_str == "YES" and current_imbalance > MAX_IMBALANCE_SHARES:
+                self.state.debug = f"SKIP YES: Too heavy on YES (+{current_imbalance:.1f})"
+                return
+
+            if side_str == "NO" and current_imbalance < -MAX_IMBALANCE_SHARES:
+                self.state.debug = f"SKIP NO: Too heavy on NO ({current_imbalance:.1f})"
                 return
 
             size = round(BET_SIZE_USDC / price, 2)
             if size < 2: return
 
-            # Fixed expiration (Now + 2 mins)
+            # 3. PLACE ORDER
             expiration = int((datetime.now(timezone.utc) + timedelta(minutes=2)).timestamp())
 
             order = OrderArgs(
@@ -365,14 +404,24 @@ class Bot:
                                                     elif aid == self.state.token_no:
                                                         self.state.ask_no = p
 
-                                            # GABAGOOL STRATEGY
+                                            # --- STRATEGY ENGINE ---
                                             if self.state.ask_yes > 0 and self.state.ask_no > 0:
+
                                                 eff_no = self.state.avg_no if self.state.qty_no > 0 else self.state.ask_no
                                                 eff_yes = self.state.avg_yes if self.state.qty_yes > 0 else self.state.ask_yes
 
-                                                if (self.state.ask_yes + eff_no) < (1.0 - TARGET_SPREAD):
+                                                # PURE ARB CHECK (If spread is NEGATIVE, buy BOTH immediately)
+                                                if (self.state.ask_yes + self.state.ask_no) < 0.99:
+                                                    # Free money: Fire both regardless of balance
                                                     await self.place_order(self.state.token_yes, self.state.ask_yes,
                                                                            "YES")
+                                                    await self.place_order(self.state.token_no, self.state.ask_no, "NO")
+
+                                                # GABAGOOL (LEGGING IN)
+                                                elif (self.state.ask_yes + eff_no) < (1.0 - TARGET_SPREAD):
+                                                    await self.place_order(self.state.token_yes, self.state.ask_yes,
+                                                                           "YES")
+
                                                 elif (self.state.ask_no + eff_yes) < (1.0 - TARGET_SPREAD):
                                                     await self.place_order(self.state.token_no, self.state.ask_no, "NO")
 
